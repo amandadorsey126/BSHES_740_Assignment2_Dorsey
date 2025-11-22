@@ -1,0 +1,394 @@
+---
+title: "Dorsey Assignment 2"
+output: html_document
+date: "2025-10-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+pacman::p_load(dplyr, caTools, tm, mlapi, e1071, caret, here, stringr, class)
+
+```
+
+
+Read in the data sources 
+```{r}
+train <- read.csv(here("train.csv"))
+test <- read.csv(here("test_without_labels.csv"))
+dev<- read.csv(here("dev.csv"))
+```
+
+
+
+
+##------Aspect-Orientation--------##
+
+
+To customize the classification strategy to address aspect-oriented sentiment classification, take the drug mentioned in the therapy column and replace its mention in the Text column with the generic keyword _THERAPY_. Use word boundaries to make sure only the full word is flagged for replacement - no variations 
+
+
+```{r}
+
+#Training data set 
+
+train <- train %>%
+  rowwise () %>% 
+  mutate(text = str_replace_all(text, 
+                                regex(paste0("\\b", therapy,"\\b"), ignore_case=TRUE), 
+                                "_THERAPY_")) %>%
+  ungroup()
+
+#Dev data set 
+
+dev <- dev %>%
+  rowwise () %>% 
+  mutate(text = str_replace_all(text, 
+                                regex(paste0("\\b", therapy, "\\b"), ignore_case=TRUE), 
+                                "_THERAPY_")) %>%
+  ungroup()
+
+```
+
+
+##--------Preprocess the data-------##
+
+Create a corps, make everything lowercase, remove punctuation, remove common English stopwords, stem words
+```{r}
+#Training data
+train_text <-train$text
+train_text_corpus <- VCorpus(VectorSource(train_text))
+train_text_corpus <- tm_map(train_text_corpus, content_transformer(tolower))
+train_text_corpus <- tm_map(train_text_corpus, removePunctuation)
+train_text_corpus <- tm_map(train_text_corpus, removeWords,stopwords("english"))
+train_text_corpus <- tm_map(train_text_corpus, stemDocument)
+length(train_text_corpus)
+
+
+#Dev data
+dev_text <-dev$text
+dev_text_corpus <- VCorpus(VectorSource(dev_text))
+dev_text_corpus <- tm_map(dev_text_corpus, content_transformer(tolower))
+dev_text_corpus <- tm_map(dev_text_corpus, removePunctuation)
+dev_text_corpus <- tm_map(dev_text_corpus, removeWords,stopwords("english"))
+dev_text_corpus <- tm_map(dev_text_corpus, stemDocument)
+length(dev_text_corpus)
+```
+Generate n-grams in each corpus (unigrams, bigrams, trigrams)
+
+```{r}
+#Tokenizer function 
+NLP_tokenizer <- function(x) {
+  unlist(lapply(ngrams(words(x), 1:3), paste, collapse = "_"), use.names = FALSE)
+}
+
+#Tokenize Training data 
+n_gram_train_corpus <- tm_map(train_text_corpus,content_transformer(NLP_tokenizer))
+
+#Tokenize Dev data 
+n_gram_dev_corpus <- tm_map(dev_text_corpus,content_transformer(NLP_tokenizer))
+
+#Verify this worked: 
+n_gram_train_corpus[[3]]$content
+```
+###---------Split the data------------###
+
+The Training and evaluation split is already performed
+
+```{r}
+#Extract the sentiment labels in the training and eval set
+train_classes <- train$label
+dev_classes <- dev$label
+
+
+#However, we still want to split the training set for hyperparameter optimization. Use an 80/20 split
+set.seed(123)
+split<- sample.split(train_classes, SplitRatio = 0.8)
+n_gram_train_corpus_split<- subset(n_gram_train_corpus, split == TRUE)
+train_classes_split <- subset(train_classes, split == TRUE)
+validation_ngram_corpus <- subset(n_gram_train_corpus, split == FALSE) 
+validation_classes <- subset(train_classes, split == FALSE)
+```
+
+
+###-------Vectorize the training data (60%)-----------###
+
+Creating a document term matrix and removing sparse terms
+
+```{r}
+training_dct_matrix <- DocumentTermMatrix(n_gram_train_corpus_split)
+training_dct_matrix_ <- removeSparseTerms(training_dct_matrix, 0.995)
+
+inspect(training_dct_matrix_)
+
+```
+
+###-------Vectorize the validation data-----------###
+
+Use the dictionary from the training document matrix!
+
+```{r}
+val_dct_matrix_ <- DocumentTermMatrix(validation_ngram_corpus, list(dictionary=colnames(training_dct_matrix_)))
+```
+
+
+
+Convert to R data frames 
+```{r}
+training_matrix_df <- as.data.frame(as.matrix(training_dct_matrix_))
+val_matrix_df<- as.data.frame(as.matrix(val_dct_matrix_))
+colnames(training_matrix_df) <- make.names(colnames(training_matrix_df))
+colnames(val_matrix_df) <- make.names(colnames(val_matrix_df))
+training_matrix_df$label <- train_classes_split
+training_matrix_df$label <- as.factor(training_matrix_df$label)
+
+```
+
+
+
+###---------Optimize Hyperparameters--------###
+
+For SVm, I want to tune the following:  
+  -cost (1,2,4,8,16, 32, 64, 128, 256)
+  -polynomial v. radial basis function 
+  
+For Random Forest, I want to tune the following: 
+  -Number of trees (10, 50, 100, 500, 1000, 2500, 5000, 7500, 10000)
+  
+  
+I want to calculate the overall accuracy and calculate the F1 score among the positive and negative classes for all hyperparameter options
+
+```{r}
+#SVM where kernel = polynomial 
+
+i = 1
+while (i<= 256) {
+  cat("==============\n")  
+cat("cost =", i, "\n")
+cat("==============\n")
+  trained_model <- svm(label~., data=training_matrix_df, cost=i, kernel = "polynomial")
+  predictions<- predict(trained_model, newdata = val_matrix_df)
+  print(i)
+cm <-  confusionMatrix(as.factor(validation_classes), predictions)
+
+print(cm)
+
+sens <-cm$byClass[,"Sensitivity"]
+ppv <- cm$byClass[, "Pos Pred Value"]
+
+f1 <- (2 * sens * ppv)/(sens+ppv) 
+
+cat("\nF1 Scores by Class:\n")
+print(f1)
+
+i = i*2
+  
+}
+
+#SVM where kernel = radial
+
+i = 1
+while (i<=256) {
+
+cat("==============\n")  
+cat("cost =", i, "\n")
+cat("==============\n")
+
+trained_model <- svm(label~., data=training_matrix_df, cost=i, kernel = "radial")
+predictions<- predict(trained_model, newdata = val_matrix_df)
+print(i)
+cm <- confusionMatrix(as.factor(validation_classes), predictions)
+  
+print(cm)
+
+sens <-cm$byClass[,"Sensitivity"]
+ppv <- cm$byClass[, "Pos Pred Value"]
+
+f1 <- (2 * sens * ppv)/(sens+ppv) 
+
+cat("\nF1 Scores by Class:\n")
+print(f1)
+
+i = i*2
+}
+
+
+#Random forest with different numbers of trees 
+
+library(randomForest)
+
+tree_val <- c(10, 50, 100, 500, 1000, 2500, 5000, 7500, 10000)
+
+rf_results<- list()
+
+for (n in tree_val){
+  
+cat("==============\n")  
+cat("ntree =", n, "\n")
+cat("==============\n")
+
+
+trained_model_rf <- randomForest(label ~ ., ntree = n, data = training_matrix_df)
+
+predictions_rf <- predict(trained_model_rf, newdata=val_matrix_df)
+
+cm <-confusionMatrix(as.factor(validation_classes), predictions_rf)
+
+ 
+print(cm)
+
+sens <-cm$byClass[,"Sensitivity"]
+ppv <- cm$byClass[, "Pos Pred Value"]
+
+f1 <- (2 * sens * ppv)/(sens+ppv) 
+
+cat("\nF1 Scores by Class:\n")
+print(f1)
+
+
+}
+
+
+
+```
+
+###--------Select the Optimized Model----------###
+
+Evaluation suggests that the optimal model is an SVM model with kernel = radial and cost = 8
+
+
+
+
+###-----------Evaluate performance on Dev dataset------------###
+
+```{r}
+#vectorize the test set. Use the column names from the training dictionary
+dev_dct_matrix_ <- DocumentTermMatrix(n_gram_dev_corpus, list(dictionary=colnames(training_dct_matrix_)))
+
+#Convert to data frames 
+dev_matrix_df <- as.data.frame(as.matrix(dev_dct_matrix_))
+colnames(dev_matrix_df) <- make.names(colnames(dev_matrix_df))
+
+```
+
+
+Train the model and generate predictions
+```{r}
+trained_model_full <- svm(label~., data=training_matrix_df, cost = 8, kernel = "radial")
+predictions_full <- predict(trained_model_full, newdata = dev_matrix_df)
+cm_final <-confusionMatrix(as.factor(dev_classes), predictions_full)
+print(cm_final)
+
+
+sens_final <-cm_final$byClass[,"Sensitivity"]
+ppv_final <- cm_final$byClass[, "Pos Pred Value"]
+
+f1_final <- (2 * sens_final * ppv_final)/(sens_final+ppv_final) 
+f1_final
+
+```
+
+###---------Classify Unlabeled Data----------###
+
+Need to use the Test dataset 
+
+Preproccess the test data 
+
+
+```{r}
+
+#Make the training aspect oriented
+test <- test %>%
+  rowwise () %>% 
+  mutate(text = str_replace_all(text, 
+                                regex(paste0("\\b", therapy,"\\b"), ignore_case=TRUE), 
+                                "_THERAPY_")) %>%
+  ungroup()
+
+
+
+#Preprocess the training data
+test_text <-test$text
+test_text_corpus <- VCorpus(VectorSource(test_text))
+test_text_corpus <- tm_map(test_text_corpus, content_transformer(tolower))
+test_text_corpus <- tm_map(test_text_corpus, removePunctuation)
+test_text_corpus <- tm_map(test_text_corpus, removeWords,stopwords("english"))
+test_text_corpus <- tm_map(test_text_corpus, stemDocument)
+length(test_text_corpus)
+
+#Generate n grams 
+
+n_gram_test_corpus <- tm_map(test_text_corpus,content_transformer(NLP_tokenizer))
+n_gram_test_corpus[[3]]$content
+```
+
+Vectorize the test set. Use the dictionary from the training document matrix
+
+```{r}
+test_dct_matrix_ <- DocumentTermMatrix(n_gram_test_corpus, list(dictionary=colnames(training_dct_matrix_)))
+```
+
+
+
+Convert to R data frames 
+```{r}
+test_matrix_df<- as.data.frame(as.matrix(test_dct_matrix_))
+colnames(test_matrix_df) <- make.names(colnames(test_matrix_df))
+```
+
+
+
+```{r}
+predictions_new <- predict(trained_model_full, newdata = test_matrix_df)
+```
+
+Build the predictions back into the dataset
+
+```{r}
+test$label <- predictions_new
+
+```
+
+
+Identify the distribution of therapies among the newly classified test data
+
+```{r}
+sort(table(test$therapy), decreasing = TRUE)
+
+#Most common: adderall, alprazolam, cannabis, oxycodone, oxycontin 
+```
+
+Explore the sentiment distributions associated with each of the most popular therapies 
+
+```{r}
+
+#Adderall: mostly neutral
+table(test$label[test$therapy == "adderall"])
+prop.table(table(test$label[test$therapy == "adderall"]))
+
+#alprazolam: mostly neutral
+table(test$label[test$therapy == "alprazolam"])
+prop.table(table(test$label[test$therapy == "alprazolam"]))
+
+#cannabis: mostly neutral
+table(test$label[test$therapy == "cannabis"])
+prop.table(table(test$label[test$therapy == "cannabis"]))
+
+
+
+#Visualize these distributions 
+
+ggplot(subset(test, therapy %in% c("adderall", "alprazolam", "cannabis")), aes(x = therapy, fill = label))+
+  geom_bar(position = "fill")+
+  scale_fill_manual(
+    values = c("negative" = "red", "neutral" = "grey", "positive" = "forestgreen")) +
+  theme_minimal() +
+  labs(x = "Therapy", y = "Proportion of Tweets", fill = "Sentiment")
+
+
+
+```
+
+
+
